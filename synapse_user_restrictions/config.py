@@ -1,4 +1,5 @@
 # Copyright 2021 The Matrix.org Foundation C.I.C.
+# Copyright 2026 sync85968211
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,31 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import enum
-import re
-from enum import Enum
-from typing import Any, Dict, Iterable, List, Pattern, Set, TypeVar, cast
-
 import attr
+from typing import Any, Dict, List, Set
 
 ConfigDict = Dict[str, Any]
 
-
-def check_and_compile_regex(value: Any) -> Pattern[str]:
-    """
-    Given a value from the configuration, which is validated to be a string,
-    compiles and returns a regular expression.
-    """
-    if not isinstance(value, str):
-        raise ValueError("Regex patterns should be specified as strings.")
-
-    try:
-        return re.compile(value)
-    except re.error as e:
-        raise ValueError(f"Invalid regex '{value}': {e.msg}")
-
-
-def check_all_permissions_understood(permissions: Iterable[str]) -> None:
+def check_all_permissions_understood(permissions: List[str]) -> None:
     """
     Checks that all the permissions contained in the list of permissions are
     ones that we understand and recognise.
@@ -51,10 +33,6 @@ def check_all_permissions_understood(permissions: Iterable[str]) -> None:
                 f"try one of: {nice_list_of_understood_permissions}"
             )
 
-
-T = TypeVar("T")
-
-
 def check_list_elements_are_strings(
     input: List[Any], failure_message: str
 ) -> List[str]:
@@ -66,81 +44,7 @@ def check_list_elements_are_strings(
         if not isinstance(ele, str):
             raise ValueError(failure_message)
 
-    return cast(List[str], input)
-
-
-class RuleResult(Enum):
-    NoDecision = enum.auto()
-    Allow = enum.auto()
-    Deny = enum.auto()
-
-
-@attr.s(auto_attribs=True, frozen=True, slots=True)
-class RegexMatchRule:
-    """
-    A single rule that performs a regex match.
-    """
-
-    # regex pattern to match users against
-    match: Pattern[str]
-
-    # permissions to allow
-    allow: Set[str]
-
-    # permissions to deny
-    deny: Set[str]
-
-    def apply(self, user_id: str, permission: str) -> RuleResult:
-        """
-        Applies a regular expression match rule, returning a rule result.
-
-        Arguments:
-            user_id: the Matrix ID (@bob:example.org) of the user being checked
-            permission: permission string identifying what kind of permission
-                is being sought
-        """
-        if not self.match.fullmatch(user_id):
-            return RuleResult.NoDecision
-
-        if permission in self.allow:
-            return RuleResult.Allow
-
-        if permission in self.deny:
-            return RuleResult.Deny
-
-        return RuleResult.NoDecision
-
-    @staticmethod
-    def from_config(rule: ConfigDict) -> "RegexMatchRule":
-        if "match" not in rule:
-            raise ValueError("Rules must have a 'match' field")
-        match_pattern = check_and_compile_regex(rule["match"])
-
-        if "allow" in rule:
-            if not isinstance(rule["allow"], list):
-                raise ValueError("Rule's 'allow' field must be a list.")
-
-            allow_list = check_list_elements_are_strings(
-                rule["allow"], "Rule's 'allow' field must be a list of strings."
-            )
-            check_all_permissions_understood(allow_list)
-        else:
-            allow_list = []
-
-        if "deny" in rule:
-            if not isinstance(rule["deny"], list):
-                raise ValueError("Rule's 'deny' field must be a list.")
-
-            deny_list = check_list_elements_are_strings(
-                rule["deny"], "Rule's 'deny' field must be a list of strings."
-            )
-            check_all_permissions_understood(deny_list)
-        else:
-            deny_list = []
-
-        return RegexMatchRule(
-            match=match_pattern, allow=set(allow_list), deny=set(deny_list)
-        )
+    return input  # type: ignore
 
 
 @attr.s(auto_attribs=True, frozen=True, slots=True)
@@ -148,47 +52,140 @@ class UserRestrictionsModuleConfig:
     """
     The root-level configuration.
     """
-
-    # A list of rules.
-    rules: List[RegexMatchRule]
-
-    # If the rules don't make a judgement about a user for a permission,
-    # this is a list of denied-by-default permissions.
+    local_homeserver: str
+    friendly_homeservers: Set[str]
+    friendly_admins: Set[str]          # full MXIDs granted invite_all
+    user_privileges: Dict[str, Set[str]]  # local username -> allowed permissions
     default_deny: Set[str]
+    blacklisted_users: Set[str]
+    blacklisted_servers: Set[str]
+    greylisted_users: Set[str]
+    greylisted_servers: Set[str]
 
     @staticmethod
     def from_config(config_dict: ConfigDict) -> "UserRestrictionsModuleConfig":
-        if "rules" not in config_dict:
-            raise ValueError("'rules' list not specified in module configuration.")
+        # local_homeserver (single, required)
+        local_hs = config_dict.get("local_homeserver")
+        if local_hs is None or not isinstance(local_hs, str):
+            raise ValueError("'local_homeserver' must be specified as a string.")
+        local_homeserver = local_hs.lower()
 
-        if not isinstance(config_dict["rules"], list):
+        # friendly_homeservers
+        friendly = config_dict.get("friendly_homeservers")
+        if friendly is None:
+            raise ValueError("'friendly_homeservers' must be specified.")
+        if not isinstance(friendly, list):
+            raise ValueError("'friendly_homeservers' should be a list.")
+        friendly_list = check_list_elements_are_strings(
+            friendly, "'friendly_homeservers' should be a list of strings."
+        )
+        friendly_homeservers = {hs.lower() for hs in friendly_list}
+
+        # friendly_admins - full MXIDs that get invite_all permission
+        friendly_admins_raw = config_dict.get("friendly_admins", [])
+        if not isinstance(friendly_admins_raw, list):
+            raise ValueError("'friendly_admins' should be a list.")
+        friendly_admins_list = check_list_elements_are_strings(
+            friendly_admins_raw, "'friendly_admins' should be a list of strings."
+        )
+        friendly_admins_set = set(friendly_admins_list)
+
+        # rules - username lists only (local users)
+        rules = config_dict.get("rules", [])
+        if not isinstance(rules, list):
             raise ValueError("'rules' should be a list.")
 
-        rules = []
-        for index, rule in enumerate(config_dict["rules"]):
+        user_privileges: Dict[str, Set[str]] = {}
+        for index, rule in enumerate(rules):
             if not isinstance(rule, dict):
                 raise ValueError(
                     f"Rules should be dicts. "
                     f"Rule number {index + 1} is not (found: {type(rule).__name__})."
                 )
-
-            rules.append(RegexMatchRule.from_config(rule))
-
-        default_deny = config_dict.get("default_deny")
-        if default_deny is not None:
-            if not isinstance(default_deny, list):
-                raise ValueError("'default_deny' should be a list (or unspecified).")
-            check_list_elements_are_strings(
-                default_deny, "'default_deny' should be a list of strings."
+            match = rule.get("match")
+            if not isinstance(match, list):
+                raise ValueError(f"Rule number {index + 1}: 'match' field must be a list of usernames.")
+            match_list = check_list_elements_are_strings(
+                match, f"Rule number {index + 1}: 'match' field must be a list of strings."
             )
-            check_all_permissions_understood(default_deny)
+
+            allow = rule.get("allow", [])
+            if not isinstance(allow, list):
+                raise ValueError(f"Rule number {index + 1}: 'allow' field must be a list.")
+            allow_list = check_list_elements_are_strings(
+                allow, f"Rule number {index + 1}: 'allow' field must be a list of strings."
+            )
+            check_all_permissions_understood(allow_list)
+
+            allow_set = set(allow_list)
+            for username in match_list:
+                if username in user_privileges:
+                    user_privileges[username] |= allow_set
+                else:
+                    user_privileges[username] = allow_set.copy()
+
+        # default_deny (local users only)
+        default_deny = config_dict.get("default_deny", [])
+        if not isinstance(default_deny, list):
+            raise ValueError("'default_deny' should be a list.")
+        default_deny_list = check_list_elements_are_strings(
+            default_deny, "'default_deny' should be a list of strings."
+        )
+        check_all_permissions_understood(default_deny_list)
+        default_deny_set = set(default_deny_list)
+
+        # blacklisted / greylisted - unchanged
+        blacklisted_users = config_dict.get("blacklisted_users", [])
+        if not isinstance(blacklisted_users, list):
+            raise ValueError("'blacklisted_users' should be a list.")
+        blacklisted_users_list = check_list_elements_are_strings(
+            blacklisted_users, "'blacklisted_users' should be a list of strings."
+        )
+        blacklisted_users_set = set(blacklisted_users_list)
+
+        blacklisted_servers = config_dict.get("blacklisted_servers", [])
+        if not isinstance(blacklisted_servers, list):
+            raise ValueError("'blacklisted_servers' should be a list.")
+        blacklisted_servers_list = check_list_elements_are_strings(
+            blacklisted_servers, "'blacklisted_servers' should be a list of strings."
+        )
+        blacklisted_servers_set = {hs.lower() for hs in blacklisted_servers_list}
+
+        greylisted_users = config_dict.get("greylisted_users", [])
+        if not isinstance(greylisted_users, list):
+            raise ValueError("'greylisted_users' should be a list.")
+        greylisted_users_list = check_list_elements_are_strings(
+            greylisted_users, "'greylisted_users' should be a list of strings."
+        )
+        greylisted_users_set = set(greylisted_users_list)
+
+        greylisted_servers = config_dict.get("greylisted_servers", [])
+        if not isinstance(greylisted_servers, list):
+            raise ValueError("'greylisted_servers' should be a list.")
+        greylisted_servers_list = check_list_elements_are_strings(
+            greylisted_servers, "'greylisted_servers' should be a list of strings."
+        )
+        greylisted_servers_set = {hs.lower() for hs in greylisted_servers_list}
 
         return UserRestrictionsModuleConfig(
-            rules=rules,
-            default_deny=set(default_deny) if default_deny is not None else set(),
+            local_homeserver=local_homeserver,
+            friendly_homeservers=friendly_homeservers,
+            friendly_admins=friendly_admins_set,
+            user_privileges=user_privileges,
+            default_deny=default_deny_set,
+            blacklisted_users=blacklisted_users_set,
+            blacklisted_servers=blacklisted_servers_set,
+            greylisted_users=greylisted_users_set,
+            greylisted_servers=greylisted_servers_set,
         )
 
 
 INVITE = "invite"
 CREATE_ROOM = "create_room"
-ALL_UNDERSTOOD_PERMISSIONS = frozenset({INVITE, CREATE_ROOM})
+RECEIVE_INVITES = "receive_invites"
+RECEIVE_ALL_INVITES = "receive_all_invites"
+INVITE_ALL = "invite_all"
+JOIN_ROOM = "join_room"
+ALL_UNDERSTOOD_PERMISSIONS = frozenset({
+    INVITE, CREATE_ROOM, RECEIVE_INVITES, RECEIVE_ALL_INVITES, INVITE_ALL, JOIN_ROOM
+})
